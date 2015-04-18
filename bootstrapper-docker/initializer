@@ -1,0 +1,195 @@
+#!/bin/bash
+set -e
+
+BOOTSTRAPPER_VERSION="$(printf '%3d.%02d' 0 1)"
+
+DEFAULT_COREOS_VERSIONS="633.1.0|647.0.0"
+
+help() {
+    echo "Volumes:"
+    echo "  /writable-proc        needed if BE_THE_GATEWAY=true"
+    echo "  /data                 CoreOS files goes into /data/tftpboot"
+    echo "Files:"
+    echo " + /data/initial-configs/dhcpd-extra.conf"
+    echo "   If exists, will be appended to /etc/dhcp/dhcpd.conf."
+    echo "Environment variables expected: (+ for optional)"
+    echo " + DOMAIN_NAME          e.g. example.org"
+    echo " + DOMAIN_NAME_SERVERS  e.g. 'ns1.example.org, 8.8.8.8'"
+    echo " + GATEWAY              default: 10.9.0.1"
+    echo " + IP                   default: 10.9.0.2, or ignored if BE_THE_GATEWAY"
+    echo " + SUBNET               default: 10.9.0.0"
+    echo " + NETMASK              default: 255.255.0.0"
+    echo " + IP_RANGE             default: '10.9.0.10 10.9.255.254'"
+    echo " + COREOS_VERSIONS      default: stable|beta=$DEFAULT_COREOS_VERSIONS"
+    echo " + COREOS_PREFIX        default: http://storage.core-os.net/coreos/amd64-usr/"
+    echo " + BE_THE_GATEWAY       default: false, pass --net=host and --privileged if you want it"
+    echo " + INTERNAL_INTERFACE   if BE_THE_GATEWAY, the interface inside cluster, default: eth0"
+    echo " + EXTERNAL_INTERFACE   if BE_THE_GATEWAY, the interface with internet, default: eth1"
+    echo " + CLOUD_CONFIG_PORT    port of the http server, providing cloud-config file, df.: 8000"
+}
+
+die() {
+    echo "$@" 1>&2;
+    echo
+    help
+    exit 1
+}
+
+if [ ! -z "$HELP" ]; then
+    help
+    exit 0
+fi
+
+DOMAIN_NAME=${DOMAIN_NAME:-"example.org"}
+DOMAIN_NAME_SERVERS=${DOMAIN_NAME_SERVERS:-`grep nameserver /etc/resolv.conf | cut -d' ' -f2 | head -n1`}
+GATEWAY=${GATEWAY:-"10.9.0.1"}
+IP=${IP:-"10.9.0.2"}
+SUBNET=${SUBNET:-"10.9.0.0"}
+NETMASK=${NETMASK:-"255.255.0.0"}
+IP_RANGE=${IP_RANGE:-"10.9.0.10 10.9.255.254"}
+COREOS_VERSIONS=${COREOS_VERSIONS:-$DEFAULT_COREOS_VERSIONS}
+COREOS_PREFIX=${COREOS_PREFIX:-"http://storage.core-os.net/coreos/amd64-usr"}
+BE_THE_GATEWAY=${BE_THE_GATEWAY:-false}
+INTERNAL_INTERFACE=${INTERNAL_INTERFACE:-"eth0"}
+EXTERNAL_INTERFACE=${EXTERNAL_INTERFACE:-"eth1"}
+CLOUD_CONFIG_PORT=${CLOUD_CONFIG_PORT:-"8000"}
+
+[ "$BE_THE_GATEWAY" = true ] && IP=${GATEWAY}
+
+echo "Initializing CoreOS Cloud Bootstrapper $BOOTSTRAPPER_VERSION ..."
+echo "IP: ${IP} - Domain Name: $DOMAIN_NAME"
+
+#####################################################################
+# Writing configs                                                   #
+#####################################################################
+mkdir -p /data/dhcpd
+touch /data/dhcpd/dhcpd.leases
+
+cat > /etc/dhcp/dhcpd.conf <<EOL
+authoritative;
+option domain-name "${DOMAIN_NAME}";
+option domain-name-servers ${DOMAIN_NAME_SERVERS};
+
+# Long lease times for cloud nodes
+default-lease-time 86400;
+max-lease-time 172800;
+
+log-facility local7;
+
+subnet ${SUBNET} netmask ${NETMASK} {
+    range ${IP_RANGE};
+    option routers ${IP};
+    filename "pxelinux.0";
+}
+EOL
+
+[ -f "/data/initial-configs/dhcpd-extra.conf" ] && cat /data/initial-configs/dhcpd-extra.conf >> /etc/dhcp/dhcpd.conf
+echo "/etc/dhcp/dhcpd.conf is updated."
+
+#####################################################################
+# PXE Files                                                         #
+#####################################################################
+mkdir -p /data/tftpboot
+
+[ -f /data/tftpboot/pxelinux.0 ] || cp /usr/lib/syslinux/pxelinux.0 /data/tftpboot/
+mkdir -p /data/tftpboot/pxelinux.cfg
+
+cat > /data/tftpboot/pxelinux.cfg/default <<EOL
+DEFAULT coreos0
+PROMPT 1
+TIMEOUT 15
+
+SAY "======================================="
+SAY "# coreos-cloud-bootstrapper ($BOOTSTRAPPER_VERSION). #"
+SAY "======================================="
+SAY ""
+SAY "The PXE mini kernel is booted, going to boot the coreos kernel."
+
+EOL
+
+gpg -q --import /etc/coreos-key.txt
+
+IFS='|' read -ra VERSIONS <<< "$COREOS_VERSIONS"
+LOOP_INDEX=0
+for VERSION in "${VERSIONS[@]}"
+do
+    echo "Downloading files for version ${VERSION}"
+    mkdir -p /data/tftpboot/${VERSION}
+
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe_image.cpio.gz -O /data/tftpboot/${VERSION}/coreos_production_pxe_image.cpio.gz
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe_image.cpio.gz.sig -O /data/tftpboot/${VERSION}/coreos_production_pxe_image.cpio.gz.sig
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe.vmlinuz -O /data/tftpboot/${VERSION}/coreos_production_pxe.vmlinuz
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe.vmlinuz.sig -O /data/tftpboot/${VERSION}/coreos_production_pxe.vmlinuz.sig
+
+    cd /data/tftpboot/${VERSION}
+    gpg -q --verify --trust-model always coreos_production_pxe.vmlinuz.sig
+    gpg -q --verify --trust-model always coreos_production_pxe_image.cpio.gz.sig
+
+    cat >> /data/tftpboot/pxelinux.cfg/default <<EOL
+
+LABEL coreos${LOOP_INDEX}
+  MENU LABEL "CoreOS ${VERSION}"
+  KERNEL ${VERSION}/coreos_production_pxe.vmlinuz
+  APPEND ${VERSION}/initrd=coreos_production_pxe_image.cpio.gz cloud-config-url=http://${IP}:${CLOUD_CONFIG_PORT}/pxe-cloud-config.yml?version=${VERSION} root=LABEL=ROOT
+EOL
+    let LOOP_INDEX=LOOP_INDEX+1
+done
+
+chmod -R 777 /data/tftpboot
+chown -R nobody /data/tftpboot
+
+#####################################################################
+# Becoming router if needed                                         #
+#####################################################################
+if [ "$BE_THE_GATEWAY" = true ]; then
+    [ -d "/writable-proc" ] || die "/writable-proc not found."
+
+    ORIG_IP_FORWARD=$(cat /writable-proc/sys/net/ipv4/ip_forward)
+
+    function shutdown() {
+        echo "Reverting changes made to the host... "
+        if [ $ORIG_IP_FORWARD -eq 0 ]; then
+            echo 0 > /writable-proc/sys/net/ipv4/ip_forward;
+        fi
+
+        # -D instead of -A, remove iptable rules in reverse direction of insertion
+        iptables -D FORWARD -i $INTERNAL_INTERFACE -o $EXTERNAL_INTERFACE -j ACCEPT
+        iptables -D FORWARD -i $EXTERNAL_INTERFACE -o $INTERNAL_INTERFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
+        iptables -t nat -D POSTROUTING -o $EXTERNAL_INTERFACE -j MASQUERADE
+
+        ip addr del $IP/$NETMASK dev $INTERNAL_INTERFACE
+
+        echo "Done"
+    }
+
+    # Allow any signal which would kill a process to stop Tomcat
+    trap shutdown HUP INT QUIT ABRT KILL ALRM TERM TSTP
+
+    if [ $ORIG_IP_FORWARD -eq 0 ]; then
+        echo 1 > /writable-proc/sys/net/ipv4/ip_forward || die "--privileged is required for BE_THE_GATEWAY"
+    fi
+
+    ip addr add $IP/$NETMASK dev $INTERNAL_INTERFACE || echo "assuming it was configured before"
+
+    iptables -t nat -A POSTROUTING -o $EXTERNAL_INTERFACE -j MASQUERADE || die "--privileged is required for BE_THE_GATEWAY"
+    iptables -A FORWARD -i $EXTERNAL_INTERFACE -o $INTERNAL_INTERFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A FORWARD -i $INTERNAL_INTERFACE -o $EXTERNAL_INTERFACE -j ACCEPT
+
+    echo "Gateway network settings are configured."
+fi
+
+cat >> /etc/supervisor/conf.d/supervisord.conf <<EOL
+[supervisord]
+nodaemon=true
+
+[program:in.tftpd]
+command=/usr/sbin/in.tftpd --foreground --address 0.0.0.0:69 --secure /data/tftpboot
+
+[program:dhcpd]
+command=/usr/sbin/dhcpd -d -q -4 -cf /etc/dhcp/dhcpd.conf -lf /data/dhcpd/dhcpd.leases $INTERNAL_INTERFACE
+EOL
+echo "/etc/supervisor/conf.d/supervisord.conf is updated."
+
+echo "CoreOS Cloud Bootstrapper initialized."
+
+/usr/bin/supervisord
