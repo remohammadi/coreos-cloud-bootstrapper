@@ -8,7 +8,7 @@ DEFAULT_COREOS_VERSIONS="633.1.0|647.0.0"
 help() {
     echo "Volumes:"
     echo "  /writable-proc        needed if BE_THE_GATEWAY=true"
-    echo "  /data                 CoreOS files goes into /data/tftpboot"
+    echo "  /data                 CoreOS files goes into /data/tftp"
     echo "Files:"
     echo " + /data/initial-configs/dhcpd-extra.conf"
     echo "   If exists, will be appended to /etc/dhcp/dhcpd.conf."
@@ -74,8 +74,6 @@ option domain-name-servers ${DOMAIN_NAME_SERVERS};
 default-lease-time 86400;
 max-lease-time 172800;
 
-log-facility local7;
-
 subnet ${SUBNET} netmask ${NETMASK} {
     range ${IP_RANGE};
     option routers ${IP};
@@ -89,21 +87,19 @@ echo "/etc/dhcp/dhcpd.conf is updated."
 #####################################################################
 # PXE Files                                                         #
 #####################################################################
-mkdir -p /data/tftpboot
+mkdir -p /data/tftp
 
-[ -f /data/tftpboot/pxelinux.0 ] || cp /usr/lib/syslinux/pxelinux.0 /data/tftpboot/
-mkdir -p /data/tftpboot/pxelinux.cfg
+[ -f /data/tftp/pxelinux.0 ] || cp /usr/lib/PXELINUX/pxelinux.0 /data/tftp/
+[ -f /data/tftp/menu.c32 ] || cp /usr/lib/syslinux/menu.c32 /data/tftp/
+mkdir -p /data/tftp/pxelinux.cfg
 
-cat > /data/tftpboot/pxelinux.cfg/default <<EOL
+cat > /data/tftp/pxelinux.cfg/default <<EOL
 DEFAULT coreos0
-PROMPT 1
-TIMEOUT 15
+TIMEOUT 30
+UI menu.c32
 
-SAY "======================================="
-SAY "# coreos-cloud-bootstrapper ($BOOTSTRAPPER_VERSION). #"
-SAY "======================================="
-SAY ""
-SAY "The PXE mini kernel is booted, going to boot the coreos kernel."
+MENU TITLE coreos-cloud-bootstrapper ($BOOTSTRAPPER_VERSION).
+MENU AUTOBOOT Starting CoreOS in 30 seconds
 
 EOL
 
@@ -114,29 +110,34 @@ LOOP_INDEX=0
 for VERSION in "${VERSIONS[@]}"
 do
     echo "Downloading files for version ${VERSION}"
-    mkdir -p /data/tftpboot/${VERSION}
+    mkdir -p /data/tftp/${VERSION}
 
-    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe_image.cpio.gz -O /data/tftpboot/${VERSION}/coreos_production_pxe_image.cpio.gz
-    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe_image.cpio.gz.sig -O /data/tftpboot/${VERSION}/coreos_production_pxe_image.cpio.gz.sig
-    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe.vmlinuz -O /data/tftpboot/${VERSION}/coreos_production_pxe.vmlinuz
-    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe.vmlinuz.sig -O /data/tftpboot/${VERSION}/coreos_production_pxe.vmlinuz.sig
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe_image.cpio.gz -O /data/tftp/${VERSION}/coreos_production_pxe_image.cpio.gz
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe_image.cpio.gz.sig -O /data/tftp/${VERSION}/coreos_production_pxe_image.cpio.gz.sig
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe.vmlinuz -O /data/tftp/${VERSION}/coreos_production_pxe.vmlinuz
+    wget -c -nv ${COREOS_PREFIX}/${VERSION}/coreos_production_pxe.vmlinuz.sig -O /data/tftp/${VERSION}/coreos_production_pxe.vmlinuz.sig
 
-    cd /data/tftpboot/${VERSION}
+    cd /data/tftp/${VERSION}
     gpg -q --verify --trust-model always coreos_production_pxe.vmlinuz.sig
     gpg -q --verify --trust-model always coreos_production_pxe_image.cpio.gz.sig
 
-    cat >> /data/tftpboot/pxelinux.cfg/default <<EOL
+    cat >> /data/tftp/pxelinux.cfg/default <<EOL
 
 LABEL coreos${LOOP_INDEX}
-  MENU LABEL "CoreOS ${VERSION}"
+  MENU LABEL CoreOS ${VERSION}
   KERNEL ${VERSION}/coreos_production_pxe.vmlinuz
-  APPEND ${VERSION}/initrd=coreos_production_pxe_image.cpio.gz cloud-config-url=http://${IP}:${CLOUD_CONFIG_PORT}/pxe-cloud-config.yml?version=${VERSION} root=LABEL=ROOT
+  APPEND initrd=${VERSION}/coreos_production_pxe_image.cpio.gz cloud-config-url=http://${IP}:${CLOUD_CONFIG_PORT}/pxe-cloud-config.yml?version=${VERSION} root=LABEL=ROOT
 EOL
     let LOOP_INDEX=LOOP_INDEX+1
 done
 
-chmod -R 777 /data/tftpboot
-chown -R nobody /data/tftpboot
+chmod 755 /data/tftp
+chmod 755 /data/tftp/*
+chmod 644 /data/tftp/*/*
+chmod 644 /data/tftp/pxelinux.0
+
+[ -f "/data/initial-configs/pxelinux-extra.conf" ] && cat /data/initial-configs/pxelinux-extra.conf >> /data/tftp/pxelinux.cfg/default
+echo "/data/tftp/pxelinux.cfg/default is updated."
 
 #####################################################################
 # Becoming router if needed                                         #
@@ -183,10 +184,18 @@ cat >> /etc/supervisor/conf.d/supervisord.conf <<EOL
 nodaemon=true
 
 [program:in.tftpd]
-command=/usr/sbin/in.tftpd --foreground --address 0.0.0.0:69 --secure /data/tftpboot
+command=/usr/sbin/in.tftpd --foreground --address 0.0.0.0:69 --secure -v --blocksize 1448 /data/tftp
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
 
 [program:dhcpd]
-command=/usr/sbin/dhcpd -d -q -4 -cf /etc/dhcp/dhcpd.conf -lf /data/dhcpd/dhcpd.leases $INTERNAL_INTERFACE
+command=/usr/sbin/dhcpd -d -4 -cf /etc/dhcp/dhcpd.conf -lf /data/dhcpd/dhcpd.leases $INTERNAL_INTERFACE
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
 EOL
 echo "/etc/supervisor/conf.d/supervisord.conf is updated."
 
