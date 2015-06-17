@@ -95,11 +95,10 @@ mkdir -p /data/tftp/pxelinux.cfg
 
 cat > /data/tftp/pxelinux.cfg/default <<EOL
 DEFAULT coreos0
-TIMEOUT 30
+TIMEOUT 80
 UI menu.c32
 
 MENU TITLE coreos-cloud-bootstrapper ($BOOTSTRAPPER_VERSION).
-MENU AUTOBOOT Starting CoreOS in 30 seconds
 
 EOL
 
