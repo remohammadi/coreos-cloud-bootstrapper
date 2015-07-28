@@ -1,0 +1,19 @@
+#cloud-config
+---
+hostname : node{{ node_num }}
+coreos:
+  etcd:
+    discovery: https://discovery.etcd.io/{{ etcd_token }}
+    addr: {{ private_ip }}:4001
+    peer-addr: {{ private_ip }}:7001
+    peer-election-timeout: 2000
+    peer-heartbeat-interval: 500
+  fleet:
+    public-ip: {{ public_ip }}
+    etcd_request_timeout: 5
+  units:
+  - name: etcd.service
+    command: start
+{% if extra %}
+{{ extra }}
+{% endif %}
